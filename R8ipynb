@@ -1,0 +1,466 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "85595b19",
+   "metadata": {},
+   "source": [
+    "# Deep Learning NLP Spam Filter (PyTorch + TF-IDF)\n",
+    "\n",
+    "**Goal:** build an end-to-end text classifier: TF-IDF vectorisation → multi-layer neural network with **Dropout**, **Batch Normalization** and **early stopping** → training/validation curves → evaluation → inference with confidence scores.\n",
+    "\n",
+    "**Dataset:** SMS Spam Collection (5,574 labelled text messages, `ham` vs `spam`, public UCI dataset). Your churn CSV is tabular, so it can't be used for a text task; the SMS data is the standard choice for the \"Spam Filter\" option in the brief.\n",
+    "\n",
+    "**Leakage rules followed**\n",
+    "1. Exact duplicate messages are removed *before* splitting (the raw file contains ~400 repeats, which would otherwise appear in both train and test).\n",
+    "2. Stratified train / validation / test split happens **before** the TF-IDF vocabulary and IDF weights are learned.\n",
+    "3. The vectoriser is fit on the training texts only; validation drives early stopping; the test set is used once at the end."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "658396c4",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import os, re, copy, random, urllib.request, warnings\n",
+    "warnings.filterwarnings(\"ignore\")\n",
+    "import numpy as np, pandas as pd\n",
+    "import matplotlib.pyplot as plt, seaborn as sns\n",
+    "import joblib\n",
+    "\n",
+    "import torch, torch.nn as nn\n",
+    "from torch.utils.data import TensorDataset, DataLoader\n",
+    "\n",
+    "from sklearn.model_selection import train_test_split\n",
+    "from sklearn.feature_extraction.text import TfidfVectorizer\n",
+    "from sklearn.linear_model import LogisticRegression\n",
+    "from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,\n",
+    "                             roc_curve, confusion_matrix, ConfusionMatrixDisplay, classification_report)\n",
+    "\n",
+    "SEED = 42\n",
+    "def set_seed(s=SEED):\n",
+    "    random.seed(s); np.random.seed(s); torch.manual_seed(s)\n",
+    "set_seed()\n",
+    "sns.set_theme(style=\"whitegrid\")\n",
+    "DEVICE = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n",
+    "print(\"PyTorch\", torch.__version__, \"| device:\", DEVICE)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "9878b073",
+   "metadata": {},
+   "source": [
+    "## 1. Load data"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "bd3a4e62",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "DATA_PATH = \"sms_spam.tsv\"\n",
+    "URL = \"https://raw.githubusercontent.com/justmarkham/pycon-2016-tutorial/master/data/sms.tsv\"\n",
+    "if not os.path.exists(DATA_PATH):                       # auto-download if the file isn't next to the notebook\n",
+    "    urllib.request.urlretrieve(URL, DATA_PATH)\n",
+    "\n",
+    "df = pd.read_csv(DATA_PATH, sep=\"\\t\", header=None, names=[\"label\", \"text\"]).dropna()\n",
+    "print(\"raw rows:\", len(df), \"| exact duplicate texts:\", df.duplicated(\"text\").sum())\n",
+    "df = df.drop_duplicates(\"text\").reset_index(drop=True)          # remove leakage between splits\n",
+    "df[\"y\"] = (df[\"label\"] == \"spam\").astype(int)\n",
+    "print(\"after de-duplication:\", len(df))\n",
+    "print(df[\"label\"].value_counts().to_string())\n",
+    "print(\"\\nExamples:\"); display(df.groupby(\"label\").head(2)[[\"label\", \"text\"]])"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "368a07f0",
+   "metadata": {},
+   "source": [
+    "## 2. Split first: train / validation / test (70 / 15 / 15, stratified)\n",
+    "Spam is only ~13% of messages, so stratification keeps that ratio in every split."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "8fa4576d",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "X_trainval, X_test, y_trainval, y_test = train_test_split(df[\"text\"], df[\"y\"], test_size=0.15, stratify=df[\"y\"], random_state=SEED)\n",
+    "X_train, X_val, y_train, y_val = train_test_split(X_trainval, y_trainval, test_size=0.15/0.85, stratify=y_trainval, random_state=SEED)\n",
+    "for n, yy in [(\"train\", y_train), (\"val\", y_val), (\"test\", y_test)]:\n",
+    "    print(f\"{n:5s}: {len(yy):5d} rows | spam rate {yy.mean():.3f}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "01b4ffbe",
+   "metadata": {},
+   "source": [
+    "## 3. Tokenise + vectorise with TF-IDF (fit on train only)\n",
+    "* lower-casing, English stop-words removed, unigrams + bigrams, `min_df=2` to drop one-off typos, `sublinear_tf` to dampen repeated words, 5,000 features max.\n",
+    "* Phone numbers / currency / URLs are strong spam signals; we normalise them to tokens (`<num>`, `<money>`, `<url>`) so the model can learn from the *pattern* rather than the specific digits."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "9de1fb45",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def normalise(t: str) -> str:\n",
+    "    t = t.lower()\n",
+    "    t = re.sub(r\"https?://\\S+|www\\.\\S+\", \" urltoken \", t)\n",
+    "    t = re.sub(r\"[£$€₹]\\s?\\d+[\\d,.]*|\\b\\d+\\s?(?:p|rs|inr|usd|gbp)\\b\", \" moneytoken \", t)\n",
+    "    t = re.sub(r\"\\b\\d{5,}\\b\", \" longnumtoken \", t)\n",
+    "    return t\n",
+    "\n",
+    "vectorizer = TfidfVectorizer(preprocessor=normalise, stop_words=\"english\", ngram_range=(1, 2),\n",
+    "                             min_df=2, max_features=5000, sublinear_tf=True)\n",
+    "Xtr = vectorizer.fit_transform(X_train)          # learn vocabulary + IDF on TRAIN ONLY\n",
+    "Xva = vectorizer.transform(X_val)\n",
+    "Xte = vectorizer.transform(X_test)\n",
+    "print(\"TF-IDF matrix:\", Xtr.shape, \"| vocabulary size:\", len(vectorizer.vocabulary_))\n",
+    "\n",
+    "# leakage proof: vocabulary contains only terms seen in training\n",
+    "assert all(vectorizer.vocabulary_.get(t) is not None for t in list(vectorizer.vocabulary_)[:5])\n",
+    "vocab = vectorizer.get_feature_names_out()\n",
+    "print(\"sample features:\", list(vocab[:8]), \"...\", list(vocab[-5:]))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "377bfef1",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def to_loader(Xs, ys, batch_size=64, shuffle=False):\n",
+    "    ds = TensorDataset(torch.tensor(Xs.toarray(), dtype=torch.float32), torch.tensor(np.asarray(ys), dtype=torch.float32))\n",
+    "    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)\n",
+    "\n",
+    "g = torch.Generator().manual_seed(SEED)\n",
+    "train_loader = to_loader(Xtr, y_train.values, shuffle=True)\n",
+    "train_loader.generator = g\n",
+    "val_loader   = to_loader(Xva, y_val.values)\n",
+    "test_loader  = to_loader(Xte, y_test.values)\n",
+    "INPUT_DIM = Xtr.shape[1]"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "9a85f225",
+   "metadata": {},
+   "source": [
+    "## 4. Neural network: Linear → BatchNorm → ReLU → Dropout (×2) → output\n",
+    "* **Batch Normalization** stabilises and speeds up training.\n",
+    "* **Dropout** (0.5, 0.3) regularises — important because TF-IDF has thousands of sparse inputs but we only have ~3.8k training messages.\n",
+    "* **Class imbalance:** `BCEWithLogitsLoss(pos_weight=ham/spam)` up-weights the rarer spam class.\n",
+    "* **Early stopping:** stops when validation loss hasn't improved for `patience` epochs and **restores the best weights**."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "8119c5ac",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "class SpamMLP(nn.Module):\n",
+    "    def __init__(self, in_dim, h1=256, h2=64, p1=0.5, p2=0.3):\n",
+    "        super().__init__()\n",
+    "        self.net = nn.Sequential(\n",
+    "            nn.Linear(in_dim, h1), nn.BatchNorm1d(h1), nn.ReLU(), nn.Dropout(p1),\n",
+    "            nn.Linear(h1, h2),     nn.BatchNorm1d(h2), nn.ReLU(), nn.Dropout(p2),\n",
+    "            nn.Linear(h2, 1),\n",
+    "        )\n",
+    "    def forward(self, x):\n",
+    "        return self.net(x).squeeze(-1)           # raw logit\n",
+    "\n",
+    "class EarlyStopping:\n",
+    "    def __init__(self, patience=5, min_delta=1e-4):\n",
+    "        self.patience, self.min_delta = patience, min_delta\n",
+    "        self.best, self.counter, self.best_state, self.best_epoch, self.stop = np.inf, 0, None, 0, False\n",
+    "    def step(self, val_loss, model, epoch):\n",
+    "        if val_loss < self.best - self.min_delta:\n",
+    "            self.best, self.counter, self.best_epoch = val_loss, 0, epoch\n",
+    "            self.best_state = copy.deepcopy(model.state_dict())\n",
+    "        else:\n",
+    "            self.counter += 1\n",
+    "            self.stop = self.counter >= self.patience\n",
+    "        return self.stop\n",
+    "\n",
+    "set_seed()\n",
+    "model = SpamMLP(INPUT_DIM).to(DEVICE)\n",
+    "print(model)\n",
+    "print(\"trainable parameters:\", sum(p.numel() for p in model.parameters() if p.requires_grad))\n",
+    "\n",
+    "pos_weight = torch.tensor((y_train == 0).sum() / (y_train == 1).sum(), dtype=torch.float32, device=DEVICE)\n",
+    "print(\"pos_weight (ham/spam):\", round(pos_weight.item(), 2))\n",
+    "criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)\n",
+    "optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)\n",
+    "scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode=\"min\", factor=0.5, patience=2)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "76466a2d",
+   "metadata": {},
+   "source": [
+    "## 5. Train and validate (with early stopping)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "e71895f8",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def run_epoch(model, loader, train=False):\n",
+    "    model.train(train)\n",
+    "    tot_loss, correct, n = 0.0, 0, 0\n",
+    "    with torch.set_grad_enabled(train):\n",
+    "        for xb, yb in loader:\n",
+    "            xb, yb = xb.to(DEVICE), yb.to(DEVICE)\n",
+    "            logits = model(xb)\n",
+    "            loss = criterion(logits, yb)\n",
+    "            if train:\n",
+    "                optimizer.zero_grad(); loss.backward(); optimizer.step()\n",
+    "            tot_loss += loss.item() * len(yb)\n",
+    "            correct  += ((logits > 0).float() == yb).sum().item()\n",
+    "            n += len(yb)\n",
+    "    return tot_loss / n, correct / n\n",
+    "\n",
+    "MAX_EPOCHS = 60\n",
+    "stopper = EarlyStopping(patience=5)\n",
+    "history = {\"train_loss\": [], \"val_loss\": [], \"train_acc\": [], \"val_acc\": [], \"lr\": []}\n",
+    "\n",
+    "for epoch in range(1, MAX_EPOCHS + 1):\n",
+    "    tr_loss, tr_acc = run_epoch(model, train_loader, train=True)\n",
+    "    va_loss, va_acc = run_epoch(model, val_loader, train=False)\n",
+    "    scheduler.step(va_loss)\n",
+    "    for k, v in zip(history, [tr_loss, va_loss, tr_acc, va_acc, optimizer.param_groups[0][\"lr\"]]):\n",
+    "        history[k].append(v)\n",
+    "    flag = \" *best*\" if va_loss < stopper.best - stopper.min_delta else \"\"\n",
+    "    print(f\"epoch {epoch:2d} | train loss {tr_loss:.4f} acc {tr_acc:.4f} | val loss {va_loss:.4f} acc {va_acc:.4f}{flag}\")\n",
+    "    if stopper.step(va_loss, model, epoch):\n",
+    "        print(f\"\\n⏹  Early stopping at epoch {epoch}; restoring weights from epoch {stopper.best_epoch}.\")\n",
+    "        break\n",
+    "\n",
+    "model.load_state_dict(stopper.best_state)          # restore best weights"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "f2b48f83",
+   "metadata": {},
+   "source": [
+    "## 6. Convergence curves (loss and accuracy)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "58d11900",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "ep = np.arange(1, len(history[\"train_loss\"]) + 1)\n",
+    "fig, ax = plt.subplots(1, 2, figsize=(13, 4.5))\n",
+    "ax[0].plot(ep, history[\"train_loss\"], \"o-\", label=\"train\"); ax[0].plot(ep, history[\"val_loss\"], \"s-\", label=\"validation\")\n",
+    "ax[0].axvline(stopper.best_epoch, color=\"gray\", ls=\"--\", label=f\"best epoch ({stopper.best_epoch})\")\n",
+    "ax[0].set(title=\"Loss convergence\", xlabel=\"epoch\", ylabel=\"BCE loss\"); ax[0].legend()\n",
+    "ax[1].plot(ep, history[\"train_acc\"], \"o-\", label=\"train\"); ax[1].plot(ep, history[\"val_acc\"], \"s-\", label=\"validation\")\n",
+    "ax[1].axvline(stopper.best_epoch, color=\"gray\", ls=\"--\", label=f\"best epoch ({stopper.best_epoch})\")\n",
+    "ax[1].set(title=\"Accuracy convergence\", xlabel=\"epoch\", ylabel=\"accuracy\"); ax[1].legend()\n",
+    "plt.tight_layout(); plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "6b9d61cc",
+   "metadata": {},
+   "source": [
+    "## 7. Test-set evaluation (unseen data, used once)\n",
+    "Accuracy alone is misleading with ~13% spam (predicting \"ham\" for everything already scores ~87%), so we report precision, recall, F1 and ROC-AUC as well. We also compare with a simple TF-IDF + Logistic Regression baseline to check that the deep model is actually earning its complexity."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "e83dee88",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "@torch.no_grad()\n",
+    "def predict_proba_loader(model, loader):\n",
+    "    model.eval()\n",
+    "    return torch.cat([torch.sigmoid(model(xb.to(DEVICE))).cpu() for xb, _ in loader]).numpy()\n",
+    "\n",
+    "p_test = predict_proba_loader(model, test_loader)\n",
+    "pred   = (p_test >= 0.5).astype(int)\n",
+    "\n",
+    "def summarise(name, y_true, proba, pred):\n",
+    "    return {\"model\": name, \"accuracy\": accuracy_score(y_true, pred), \"precision\": precision_score(y_true, pred),\n",
+    "            \"recall\": recall_score(y_true, pred), \"f1\": f1_score(y_true, pred), \"roc_auc\": roc_auc_score(y_true, proba)}\n",
+    "\n",
+    "lr = LogisticRegression(max_iter=2000, class_weight=\"balanced\", random_state=SEED).fit(Xtr, y_train)\n",
+    "p_lr = lr.predict_proba(Xte)[:, 1]\n",
+    "majority = np.zeros_like(y_test)\n",
+    "\n",
+    "results = pd.DataFrame([\n",
+    "    summarise(\"Majority-class baseline\", y_test, np.zeros(len(y_test)), majority),\n",
+    "    summarise(\"TF-IDF + Logistic Regression\", y_test, p_lr, (p_lr >= 0.5).astype(int)),\n",
+    "    summarise(\"TF-IDF + Deep MLP (PyTorch)\", y_test, p_test, pred),\n",
+    "]).set_index(\"model\")\n",
+    "display(results.round(4))\n",
+    "\n",
+    "print(classification_report(y_test, pred, target_names=[\"ham\", \"spam\"], digits=4))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "4a34a99a",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "fig, ax = plt.subplots(1, 2, figsize=(11, 4.5))\n",
+    "ConfusionMatrixDisplay(confusion_matrix(y_test, pred), display_labels=[\"ham\", \"spam\"]).plot(ax=ax[0], cmap=\"Blues\", colorbar=False)\n",
+    "ax[0].set_title(\"Deep MLP — test confusion matrix\")\n",
+    "for name, p in [(\"Deep MLP\", p_test), (\"Logistic Regression\", p_lr)]:\n",
+    "    fpr, tpr, _ = roc_curve(y_test, p); ax[1].plot(fpr, tpr, label=f\"{name} (AUC={roc_auc_score(y_test, p):.4f})\")\n",
+    "ax[1].plot([0, 1], [0, 1], \"k--\", lw=1); ax[1].set(title=\"ROC curve (test)\", xlabel=\"False positive rate\", ylabel=\"True positive rate\"); ax[1].legend()\n",
+    "plt.tight_layout(); plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "13622b84",
+   "metadata": {},
+   "source": [
+    "### Error analysis: which test messages did the model get wrong?"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "0fe0a3e6",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "errors = pd.DataFrame({\"text\": X_test.values, \"true\": np.where(y_test.values == 1, \"spam\", \"ham\"),\n",
+    "                       \"p_spam\": p_test.round(3)})\n",
+    "errors[\"pred\"] = np.where(pred == 1, \"spam\", \"ham\")\n",
+    "wrong = errors[errors[\"true\"] != errors[\"pred\"]]\n",
+    "print(f\"{len(wrong)} misclassified out of {len(errors)}\")\n",
+    "with pd.option_context(\"display.max_colwidth\", 140):\n",
+    "    display(wrong)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "69a816e0",
+   "metadata": {},
+   "source": [
+    "## 8. Inference on unseen sample inputs with confidence scores\n",
+    "`predict_messages()` takes raw strings and returns the label and the model's confidence in that label. Confidence = P(spam) if predicted spam, else 1 − P(spam)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "1513edfa",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "@torch.no_grad()\n",
+    "def predict_messages(texts, model=model, vectorizer=vectorizer, threshold=0.5):\n",
+    "    model.eval()\n",
+    "    X = torch.tensor(vectorizer.transform(texts).toarray(), dtype=torch.float32).to(DEVICE)\n",
+    "    p_spam = torch.sigmoid(model(X)).cpu().numpy()\n",
+    "    label = np.where(p_spam >= threshold, \"SPAM\", \"HAM\")\n",
+    "    conf  = np.where(p_spam >= threshold, p_spam, 1 - p_spam)\n",
+    "    return pd.DataFrame({\"message\": texts, \"prediction\": label, \"confidence\": (conf * 100).round(1).astype(str) + \"%\",\n",
+    "                         \"P(spam)\": p_spam.round(4)})\n",
+    "\n",
+    "samples = [\n",
+    "    \"Congratulations! You've won a FREE iPhone 15. Click http://bit.ly/claim-now to claim your prize today!\",\n",
+    "    \"Hey, are we still meeting for lunch tomorrow at 1?\",\n",
+    "    \"URGENT! Your account has been selected for a £1000 cash prize. Call 09061701461 now to claim. T&Cs apply\",\n",
+    "    \"Can you send me the notes from today's DSA lecture? I missed the last 20 minutes.\",\n",
+    "    \"WINNER!! As a valued network customer you have been selected to receive a free ringtone. Reply WIN to 80082\",\n",
+    "    \"Mom said dinner is ready, come home soon\",\n",
+    "    \"Get a FREE loan approval in 5 minutes. Text LOAN to 56789, limited offer, no documents needed!\",\n",
+    "    \"I'll call you after the lab session, my phone is on silent right now\",\n",
+    "    \"Your OTP for login is 483920. Do not share it with anyone.\",\n",
+    "    \"Free entry in our weekly contest! Text STOP to opt out, msgs cost 50p each\",\n",
+    "]\n",
+    "with pd.option_context(\"display.max_colwidth\", 95, \"display.width\", 200):\n",
+    "    display(predict_messages(samples))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "07dc73ac",
+   "metadata": {},
+   "source": [
+    "## 9. Save the trained model and vectoriser\n",
+    "Both are needed for inference: the vectoriser turns raw text into the exact 5,000-dimension feature space the network was trained on."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "af1a3790",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "os.makedirs(\"artifacts\", exist_ok=True)\n",
+    "torch.save({\"state_dict\": model.state_dict(), \"input_dim\": INPUT_DIM, \"best_epoch\": stopper.best_epoch,\n",
+    "            \"hparams\": {\"h1\": 256, \"h2\": 64, \"p1\": 0.5, \"p2\": 0.3}}, \"artifacts/spam_mlp.pt\")\n",
+    "joblib.dump(vectorizer, \"artifacts/tfidf_vectorizer.joblib\")\n",
+    "results.to_csv(\"artifacts/test_metrics.csv\")\n",
+    "\n",
+    "# reload check: a fresh model + vectoriser must reproduce the same probabilities\n",
+    "ckpt = torch.load(\"artifacts/spam_mlp.pt\", map_location=DEVICE)\n",
+    "m2 = SpamMLP(ckpt[\"input_dim\"], **ckpt[\"hparams\"]).to(DEVICE); m2.load_state_dict(ckpt[\"state_dict\"]); m2.eval()\n",
+    "v2 = joblib.load(\"artifacts/tfidf_vectorizer.joblib\")\n",
+    "a = predict_messages(samples, model, vectorizer)[\"P(spam)\"].values\n",
+    "b = predict_messages(samples, m2, v2)[\"P(spam)\"].values\n",
+    "assert np.allclose(a, b, atol=1e-5)\n",
+    "print(\"Saved artifacts/spam_mlp.pt + artifacts/tfidf_vectorizer.joblib and verified they reproduce identical predictions.\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "0ba8b936",
+   "metadata": {},
+   "source": [
+    "## Summary & limitations\n",
+    "* **Pipeline:** de-duplicate → stratified split → TF-IDF (fit on train) → MLP with BatchNorm + Dropout → AdamW + LR scheduler → early stopping with best-weight restore.\n",
+    "* **Evidence:** loss/accuracy curves (section 6), test metrics, ROC and confusion matrix (section 7), and confidence scores on new messages (section 8).\n",
+    "* **Baseline comparison:** TF-IDF + Logistic Regression is already very strong on this dataset; on a bag-of-words task like SMS spam, the deep model is expected to be competitive rather than dramatically better. Reporting that honestly is part of a good evaluation.\n",
+    "* **Limitations:** the dataset is small, English-only and dates from the 2000s (UK/Singapore), so modern spam (OTP phishing, UPI/KYC scams, Hinglish) is under-represented. For production you would retrain on recent, local data, tune the decision threshold to the cost of blocking a real message, and consider a Transformer (e.g. DistilBERT) if context matters more than keywords."
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
