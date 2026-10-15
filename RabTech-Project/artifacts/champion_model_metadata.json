@@ -1,0 +1,19 @@
+{
+  "champion": "Logistic Regression",
+  "best_params": {
+    "C": 1,
+    "penalty": "l2"
+  },
+  "selection_rule": "max mean CV ROC-AUC, tie-break CV F1, then simplicity",
+  "cv": "StratifiedKFold(n_splits=3, shuffle=True, random_state=42)",
+  "n_train": 9,
+  "n_test": 3,
+  "features": [
+    "tenure_months",
+    "support_tickets",
+    "monthly_spend_inr",
+    "last_login_days",
+    "plan_type"
+  ],
+  "target": "churned"
+}
